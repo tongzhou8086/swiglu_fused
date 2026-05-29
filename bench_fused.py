@@ -18,6 +18,17 @@ import triton.testing as tt
 
 from swiglu.matmul_fused_swiglu import matmul_fused_swiglu
 
+# Optional: colleague's Triton implementation (swiglu/triton/impls.py).
+try:
+    from swiglu.triton.impls import (
+        fused_swiglu_wide_packed,
+        pack_swiglu_weight_chunked_torch,
+    )
+    HAS_TRITON_VARIANT = True
+except Exception as _e:
+    print(f"[note] Triton variant unavailable: {_e}")
+    HAS_TRITON_VARIANT = False
+
 M, K, N = 32768, 3072, 12288
 torch.manual_seed(0)
 
@@ -63,7 +74,28 @@ print()
 print(f"=== timings (M={M}  K={K}  N={N}) ===")
 t_b1 = bench(b1_eager,    "B1  cuBLAS [M,2N] + eager silu(r)*l")
 t_b2 = bench(b2_compiled, "B2  cuBLAS [M,2N] + torch.compile silu(r)*l")
-t_v4 = bench(v4_fused,    "V4  single-kernel fused")
+t_v4 = bench(v4_fused,    "V4  CUDA single-kernel (dual-TMEM, ours)")
+
+if HAS_TRITON_VARIANT:
+    # Triton "wide_packed" expects [up|gate] chunk-interleaved layout.
+    # Our W convention is [up|gate] concatenated (left half = up, right = gate),
+    # which matches the input the pack helper expects: pack_swiglu_weight_chunked_torch
+    # ingests [K, 2N_HALF] = [K, N_HALF (left) | N_HALF (gate)] and emits the
+    # chunk-interleaved packed buffer.
+    W_packed = pack_swiglu_weight_chunked_torch(W)
+
+    # Validate against the same fp32 reference.
+    C_t = fused_swiglu_wide_packed(x, W_packed).float()
+    diff_t = (C_t - C_ref).abs()
+    print(f"validate Triton: max_abs={diff_t.max():.3e}  mean_abs={diff_t.mean():.3e}  "
+          f"atol={atol:.2f}  →  {'OK' if diff_t.max() <= atol else 'FAIL'}")
+
+    def triton_fused():
+        return fused_swiglu_wide_packed(x, W_packed)
+
+    t_tr = bench(triton_fused, "T1  Triton wide_packed (colleague)")
+else:
+    t_tr = None
 
 # Component breakdown
 t_gemm = bench(lambda: x @ W, "    cuBLAS [M,2N] GEMM only")
@@ -74,3 +106,6 @@ t_act_comp  = bench(lambda: act_compiled(gu, N),           "    activation compi
 print()
 print(f"V4 vs B1: {t_b1 / t_v4:.3f}x")
 print(f"V4 vs B2: {t_b2 / t_v4:.3f}x   ← fair baseline")
+if t_tr is not None:
+    print(f"V4 vs T1: {t_tr / t_v4:.3f}x   (>1 = V4 faster, <1 = Triton faster)")
+    print(f"T1 vs B2: {t_b2 / t_tr:.3f}x")
