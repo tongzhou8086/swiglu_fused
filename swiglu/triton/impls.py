@@ -3714,6 +3714,194 @@ def _run_shape(
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Fused backward bwd_x kernel: (dy * factors) @ W.t() → grad_x.
+#
+# Mirrors `_fused_swiglu_wide_packed_kernel` structurally — same TMA
+# descriptor pattern, same persistent loop, same WARP_SPECIALIZE / FLATTEN.
+# Difference: the LHS of the GEMM is computed on the fly each K-iter from
+# (dy, factors) instead of loaded directly.
+#
+# Inputs:
+#   dy       : [M, N_HALF]    bf16  (the upstream grad)
+#   factors  : [M, 2*N_HALF]  bf16  (chunk-packed [left | gate] layout)
+#   W        : [K, 2*N_HALF]  bf16  (same as the forward weight; we
+#                                     access it transposed via tl.trans)
+#
+# Output:
+#   grad_x   : [M, K]         bf16  = (dy ⊙ factors) @ W.t()
+#
+# Block-size convention (chosen to mirror the forward kernel):
+#   BLOCK_M       = 128      → output tile rows
+#   BLOCK_K_OUT   = 64       → output tile cols (along the OUTPUT K=model_K axis)
+#   BLOCK_N_HALF  = 128      → dy slice cols (and per-chunk factor cols)
+#   BLOCK_N2      = 2*BLOCK_N_HALF = 256 → GEMM K-axis tile (factors slice cols)
+#
+# K-loop count = N_HALF / BLOCK_N_HALF = 14336/128 = 112 iters at the
+# colleague's shape — 2× the forward's 56, but each iter is the same
+# MMA shape (BM×BK×BN_OUT).  Sums to the same FLOPs as cuBLAS NT.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+@triton.jit
+def _fused_grad_x_kernel(
+    dy_ptr,           # [M, N_HALF]    bf16
+    factors_ptr,      # [M, 2*N_HALF]  bf16, chunked
+    w_ptr,            # [K, 2*N_HALF]  bf16
+    grad_x_ptr,       # [M, K]         bf16
+    M:            tl.constexpr,
+    K:            tl.constexpr,
+    N_HALF:       tl.constexpr,
+    NUM_SMS:      tl.constexpr,
+    BLOCK_M:      tl.constexpr,
+    BLOCK_K_OUT:  tl.constexpr,
+    BLOCK_N_HALF: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    WARP_SPECIALIZE_: tl.constexpr,
+    FLATTEN:      tl.constexpr,
+):
+    start_pid = tl.program_id(axis=0)
+    BLOCK_N2: tl.constexpr = BLOCK_N_HALF * 2
+
+    num_pid_m: tl.constexpr = tl.cdiv(M, BLOCK_M)
+    num_pid_k: tl.constexpr = tl.cdiv(K, BLOCK_K_OUT)
+    n_half_tiles: tl.constexpr = tl.cdiv(N_HALF, BLOCK_N_HALF)
+    num_tiles: tl.constexpr = num_pid_m * num_pid_k
+    num_pid_in_group: tl.constexpr = GROUP_SIZE_M * num_pid_k
+
+    dy_desc = tl.make_tensor_descriptor(
+        dy_ptr,
+        shape=[M, N_HALF],
+        strides=[N_HALF, 1],
+        block_shape=[BLOCK_M, BLOCK_N_HALF],
+    )
+    fac_desc = tl.make_tensor_descriptor(
+        factors_ptr,
+        shape=[M, N_HALF * 2],
+        strides=[N_HALF * 2, 1],
+        block_shape=[BLOCK_M, BLOCK_N2],
+    )
+    w_desc = tl.make_tensor_descriptor(
+        w_ptr,
+        shape=[K, N_HALF * 2],
+        strides=[N_HALF * 2, 1],
+        block_shape=[BLOCK_K_OUT, BLOCK_N2],
+    )
+    gx_desc = tl.make_tensor_descriptor(
+        grad_x_ptr,
+        shape=[M, K],
+        strides=[K, 1],
+        block_shape=[BLOCK_M, BLOCK_K_OUT],
+    )
+
+    for tile_id in tl.range(
+        start_pid,
+        num_tiles,
+        NUM_SMS,
+        flatten=FLATTEN,
+        warp_specialize=WARP_SPECIALIZE_,
+    ):
+        pid_m, pid_k = _compute_pid(
+            tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M
+        )
+        offs_m = pid_m * BLOCK_M
+        offs_k_out = pid_k * BLOCK_K_OUT
+
+        acc = tl.zeros((BLOCK_M, BLOCK_K_OUT), dtype=tl.float32)
+        for ki in range(n_half_tiles):
+            offs_n_half = ki * BLOCK_N_HALF
+            offs_n2     = ki * BLOCK_N2
+
+            dy_tile = dy_desc.load([offs_m, offs_n_half]).to(tl.float32)
+            fac_tile = fac_desc.load([offs_m, offs_n2]).to(tl.float32)
+
+            # Split factors into [left | gate] halves (chunked layout —
+            # same as `_swiglu_packed_grad_de_from_factors_kernel`).
+            fac3 = tl.reshape(fac_tile, (BLOCK_M, 2, BLOCK_N_HALF))
+            fac3 = tl.permute(fac3, (0, 2, 1))
+            fl, fg = tl.split(fac3)
+
+            # grad_de chunk = [dy * fl | dy * fg] in the same chunked layout.
+            gde_l = (dy_tile * fl).to(grad_x_ptr.dtype.element_ty)
+            gde_g = (dy_tile * fg).to(grad_x_ptr.dtype.element_ty)
+            gde = tl.cat(gde_l, gde_g, dim=1)
+
+            # Load W tile (K_OUT × N2) and transpose it for the dot product.
+            w_tile = w_desc.load([offs_k_out, offs_n2])
+            w_t = tl.trans(w_tile)
+
+            acc = tl.dot(gde, w_t, acc)
+
+        gx_desc.store([offs_m, offs_k_out], acc.to(grad_x_ptr.dtype.element_ty))
+
+
+# Tuning knobs (separate from the forward's so we can iterate independently).
+# CRITICAL: BLOCK_N_HALF must match the chunk width that the elementwise
+# kernel uses when packing factors (= BWD_FACTORS_BLOCK_SIZE_N_HALF = 128).
+# Otherwise per-K-iter we'd straddle a left/gate boundary and the dy*factors
+# pairing breaks.
+#
+# SMEM budget per stage:
+#   dy      : BM × BN_HALF × 2
+#   factors : BM × BN2     × 2  (BN2 = 2*BN_HALF)
+#   W       : BK × BN2     × 2
+# At BM=64, BNH=128, BK=64, NS=2: (16+32+32)·2 = 160 KB — fits 228 KB cap.
+FUSED_GX_BLOCK_M       = 128
+FUSED_GX_BLOCK_K_OUT   = 64
+FUSED_GX_BLOCK_N_HALF  = 128
+FUSED_GX_GROUP_SIZE_M  = 16
+FUSED_GX_NUM_WARPS     = 8
+FUSED_GX_NUM_STAGES    = 1   # NS=1 forced: 3 inputs × full tiles barely fit
+FUSED_GX_WARP_SPEC     = True
+FUSED_GX_FLATTEN       = True
+
+
+def fused_grad_x(
+    dy: torch.Tensor,
+    factors: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    """One-shot (dy * factors) @ W.t() → grad_x.
+
+    Status-quo equivalent: (Triton elementwise dy*factors) + (cuBLAS NT).
+    """
+    _ensure_allocator()
+    assert dy.is_cuda and factors.is_cuda and weight.is_cuda
+    assert dy.is_contiguous() and factors.is_contiguous() and weight.is_contiguous()
+
+    M, N_HALF = dy.shape
+    M2, twoN = factors.shape
+    K, twoN2 = weight.shape
+    assert M2 == M and twoN == 2 * N_HALF and twoN2 == twoN
+
+    grad_x = torch.empty(M, K, device=dy.device, dtype=dy.dtype)
+    device_index = dy.device.index if dy.device.index is not None else torch.cuda.current_device()
+    num_sms = _num_sms(device_index)
+
+    BM = FUSED_GX_BLOCK_M
+    BK = FUSED_GX_BLOCK_K_OUT
+    BNH = FUSED_GX_BLOCK_N_HALF
+    grid = (min(num_sms, triton.cdiv(M, BM) * triton.cdiv(K, BK)),)
+
+    _fused_grad_x_kernel[grid](
+        dy,
+        factors,
+        weight,
+        grad_x,
+        M, K, N_HALF,
+        NUM_SMS          = num_sms,
+        BLOCK_M          = BM,
+        BLOCK_K_OUT      = BK,
+        BLOCK_N_HALF     = BNH,
+        GROUP_SIZE_M     = FUSED_GX_GROUP_SIZE_M,
+        WARP_SPECIALIZE_ = FUSED_GX_WARP_SPEC,
+        FLATTEN          = FUSED_GX_FLATTEN,
+        num_warps        = FUSED_GX_NUM_WARPS,
+        num_stages       = FUSED_GX_NUM_STAGES,
+    )
+    return grad_x
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=int, default=0)
