@@ -3,14 +3,14 @@
   V1  cuBLAS big GEMM (out [M, 2N]) + torch.compile'd swiglu activation
       (split + silu + mul).  No fusion into the matmul.
 
-  V2  Triton fused + side-store of factors  (production save_factors path).
+  V2  Triton fused, NO save factors.  One kernel does GEMM + split + silu
+      + mul + writes out only.  Same work as V3 minus the 1.6 GB factors
+      write — establishes V3's "ceiling".
+
+  V3  Triton fused + side-store of factors  (production save_factors path).
       One kernel does GEMM + split + silu + mul + writes [out | factors].
 
-  V3  Triton fused, NO save factors.  One kernel does GEMM + split + silu
-      + mul + writes out only.  Same work as V2 minus the 1.6 GB factors
-      write — establishes V2's "ceiling".
-
-V2 - V3 = the side-store cost.  V3 - V1's GEMM-only cuBLAS = the
+V3 - V2 = the side-store cost.  V2 - V1's GEMM-only cuBLAS = the
 "Triton-vs-cuBLAS GEMM gap" for the fused kernel.
 """
 import math, os, sys
@@ -64,18 +64,18 @@ def v1_cublas_plus_compiled():
     preact = x @ W_normal      # [M, 2N], cuBLAS NN
     return _compiled_swiglu(preact)
 
-# ── V2: Triton fused + save factors ──
-def v2_triton_save_factors():
-    return swp.fused_swiglu_wide_packed_save_factors(x, W_packed)
-
-# ── V3: Triton fused, no save factors ──
-def v3_triton_no_save():
+# ── V2: Triton fused, no save factors ──
+def v2_triton_no_save():
     return swp.fused_swiglu_wide_packed(x, W_packed)
+
+# ── V3: Triton fused + save factors (production) ──
+def v3_triton_save_factors():
+    return swp.fused_swiglu_wide_packed_save_factors(x, W_packed)
 
 # ── correctness ─────────────────────────────────────────────────────
 out_v1 = v1_cublas_plus_compiled()
-out_v2, fac_v2 = v2_triton_save_factors()
-out_v3 = v3_triton_no_save()
+out_v2 = v2_triton_no_save()
+out_v3, fac_v3 = v3_triton_save_factors()
 
 e12 = (out_v1.float() - out_v2.float()).abs().max().item()
 e13 = (out_v1.float() - out_v3.float()).abs().max().item()
@@ -106,8 +106,8 @@ t0 = time.time()
 i = 0
 while time.time() - t0 < 4.0:
     v1_cublas_plus_compiled()
-    v2_triton_save_factors()
-    v3_triton_no_save()
+    v2_triton_no_save()
+    v3_triton_save_factors()
     i += 1
 torch.cuda.synchronize()
 print(f"  warm calls: {i*3}", flush=True)
@@ -117,48 +117,44 @@ print("=== timings ===")
 # HBM accounting per variant (rough):
 #   V1 : read x + read W + write preact + read preact + write out
 #        = 0.08 + 0.20 + 0.64 + 0.64 + 0.32 = 1.88 GB
-#   V2 : read x + read W + write out + write factors
-#        = 0.08 + 0.20 + 0.32 + 0.64 = 1.24 GB
-#   V3 : read x + read W + write out
+#   V2 : read x + read W + write out
 #        = 0.08 + 0.20 + 0.32 = 0.60 GB
+#   V3 : read x + read W + write out + write factors
+#        = 0.08 + 0.20 + 0.32 + 0.64 = 1.24 GB
 bytes_v1 = B_x + B_W + B_preact + B_preact + B_out      # 1.88 GB
-bytes_v2 = B_x + B_W + B_out + B_factors                # 1.24 GB
-bytes_v3 = B_x + B_W + B_out                            # 0.60 GB
+bytes_v2 = B_x + B_W + B_out                            # 0.60 GB
+bytes_v3 = B_x + B_W + B_out + B_factors                # 1.24 GB
 
 # cuBLAS-only ceiling
 def cublas_only():
     return x @ W_normal
-def cublas_packed_only():
-    return x @ W_packed   # same FLOPs, just different memory layout
 
 t_cublas      = bench(cublas_only,                "cuBLAS x @ W (no activation, no fusion)",
                       total_bytes=B_x + B_W + B_preact)
 t_v1          = bench(v1_cublas_plus_compiled,    "V1 cuBLAS + compiled swiglu",
                       total_bytes=bytes_v1)
-t_v2          = bench(v2_triton_save_factors,     "V2 Triton fused + side-store factors",
+t_v2          = bench(v2_triton_no_save,          "V2 Triton fused (no save)",
                       total_bytes=bytes_v2)
-t_v3          = bench(v3_triton_no_save,          "V3 Triton fused (no save)",
+t_v3          = bench(v3_triton_save_factors,     "V3 Triton fused + side-store factors",
                       total_bytes=bytes_v3)
 print()
 
 print("=== analysis ===")
-print(f"  V2 − V3 (side-store cost)        : {(t_v2 - t_v3)*1000:+.0f} µs")
-print(f"  V3 − cuBLAS (Triton-vs-cuBLAS gap for GEMM-only): {(t_v3 - t_cublas)*1000:+.0f} µs")
-print(f"  V2 − V1 (production savings)     : {(t_v2 - t_v1)*1000:+.0f} µs")
-print(f"  V3 / cuBLAS                      : {t_v3 / t_cublas * 100:5.1f}% of GEMM-only time")
-print(f"  V2 / V3                          : {t_v2 / t_v3 * 100:5.1f}% (side-store ratio)")
+print(f"  V3 − V2 (side-store cost)        : {(t_v3 - t_v2)*1000:+.0f} µs")
+print(f"  V2 − cuBLAS (Triton-vs-cuBLAS gap for GEMM-only): {(t_v2 - t_cublas)*1000:+.0f} µs")
+print(f"  V3 − V1 (production savings)     : {(t_v3 - t_v1)*1000:+.0f} µs")
+print(f"  V2 / cuBLAS                      : {t_v2 / t_cublas * 100:5.1f}% of GEMM-only time")
+print(f"  V3 / V2                          : {t_v3 / t_v2 * 100:5.1f}% (side-store ratio)")
 print()
 
 print("=== HBM efficiency ===")
-print(f"  V2 HBM/s : {bytes_v2 / (t_v2/1e3):.0f} GB/s   (B200 peak ~7700 GB/s)")
-print(f"  V3 HBM/s : {bytes_v3 / (t_v3/1e3):.0f} GB/s")
+print(f"  V3 HBM/s : {bytes_v3 / (t_v3/1e3):.0f} GB/s   (B200 peak ~7700 GB/s)")
+print(f"  V2 HBM/s : {bytes_v2 / (t_v2/1e3):.0f} GB/s")
 print()
 
 print("=== upper-bound floors ===")
-# If V2 were perfectly HBM-bound at 6500 GB/s:
-hbm_floor_v2 = bytes_v2 / 6500 * 1000  # ms
-# If V2 were perfectly compute-bound at cuBLAS speed:
-compute_floor = t_cublas * 1000
-print(f"  HBM-bound floor at 6500 GB/s for V2 : {hbm_floor_v2:.3f} ms")
-print(f"  compute-bound floor (= cuBLAS GEMM) : {compute_floor:.3f} ms")
-print(f"  V2 measured                         : {t_v2*1000:.3f} ms")
+# All times in ms.  do_bench returns ms; HBM bytes are in GB; 1 GB / (GB/s) = s, *1000 = ms.
+hbm_floor_v3 = bytes_v3 / 6500 * 1000   # ms
+print(f"  HBM-bound floor at 6500 GB/s for V3 : {hbm_floor_v3:.3f} ms")
+print(f"  compute-bound floor (= cuBLAS GEMM) : {t_cublas:.3f} ms")
+print(f"  V3 measured                         : {t_v3:.3f} ms")
