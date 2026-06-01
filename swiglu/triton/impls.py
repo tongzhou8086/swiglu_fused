@@ -3981,6 +3981,9 @@ def swiglu_grad_preact_normal_inplace(preact: torch.Tensor, dy: torch.Tensor) ->
     preact: in-place output buffer; on entry holds preact, on exit holds grad_preact.
     dy    : [M, N] upstream gradient.
     Returns the same `preact` tensor for convenience.
+
+    Implementation: calls _swiglu_grad_preact_normal_kernel with
+    out_ptr == preact_ptr (aliased) — see that kernel's docstring.
     """
     _ensure_allocator()
     assert preact.is_cuda and dy.is_cuda
@@ -3993,8 +3996,8 @@ def swiglu_grad_preact_normal_inplace(preact: torch.Tensor, dy: torch.Tensor) ->
         triton.cdiv(M, INPLACE_BWD_BLOCK_M)
         * triton.cdiv(N, INPLACE_BWD_BLOCK_N_HALF),
     )
-    _swiglu_grad_preact_normal_inplace_kernel[grid](
-        preact, dy,
+    _swiglu_grad_preact_normal_kernel[grid](
+        preact, dy, preact,    # out_ptr aliased to preact_ptr → in-place
         M, N,
         BLOCK_M=INPLACE_BWD_BLOCK_M,
         BLOCK_N_HALF=INPLACE_BWD_BLOCK_N_HALF,
