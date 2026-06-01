@@ -4,13 +4,18 @@ PyTorch's default autograd allocates a fresh grad_preact buffer in backward
 instead of overwriting the saved preact.
 
 Variants tested:
-  V0  cuBLAS + compiled fwd, default-shape backward (FRESH grad_preact buffer)
-  V1  cuBLAS + compiled fwd, IN-PLACE backward over preact via custom autograd
-  V2  Triton fused save_factors fwd + in-place backward elementwise (production)
-
-V0 = "what PyTorch would do today, eager-friendly".
-V1 = "fix the PyTorch issue without writing a fused matmul kernel".
-V2 = the production path we want V1 to be directly comparable to.
+  V_naive  presentation baseline — y = _compiled_swiglu(F.linear(x, weight))
+           with NO custom autograd; PyTorch handles backward via its default
+           machinery.  Closest equivalent to swiglu_fusion_notes.md's
+           `baseline_F_linear`.
+  V0       custom autograd, FRESH grad_preact buffer in backward.  Controls
+           for V1 by keeping the same Triton kernel; only the buffer
+           aliasing differs.
+  V1       custom autograd, IN-PLACE backward over preact via the same
+           Triton kernel.  The "fix the PyTorch issue without writing a
+           fused matmul kernel" variant.
+  V2       Triton fused save_factors fwd + in-place backward elementwise
+           (production path we want V1 to be directly comparable to).
 
 All three share the same forward COMPUTE GRAPH semantics
   y = silu(gate) * left  where [left|gate] = x @ weight.t()
@@ -59,6 +64,15 @@ def _compiled_swiglu(preact):
     left = preact[..., :n_half]
     gate = preact[..., n_half:]
     return left * F.silu(gate)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# V_naive  presentation baseline : NO custom autograd at all.  PyTorch
+# handles backward via whatever it generates for F.linear + compiled swiglu.
+# Closest equivalent to swiglu_fusion_notes.md's `baseline_F_linear`.
+# ─────────────────────────────────────────────────────────────────────
+def baseline_naive(x, weight):
+    return _compiled_swiglu(F.linear(x, weight))
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -134,7 +148,10 @@ def fresh_leaves(x_buf, w_leaf):
 # ─────────────────────────────────────────────────────────────────────
 def correctness_check(x0, weight, W_packed, grad_y):
     print("correctness:")
-    # V0 reference.
+    # V_naive reference.
+    xn, wn = fresh_leaves(x0, weight)
+    yn = baseline_naive(xn, wn); yn.backward(grad_y)
+    # V0.
     xa, wa = fresh_leaves(x0, weight)
     ya = baseline_freshbuf(xa, wa); ya.backward(grad_y)
     # V1.
@@ -144,19 +161,20 @@ def correctness_check(x0, weight, W_packed, grad_y):
     xc, wc = fresh_leaves(x0, W_packed)
     yc = swp.fused_swiglu_wide_packed_save_factors_autograd(xc, wc); yc.backward(grad_y)
 
-    e_y   = (ya - yb).float().abs().max().item()
-    e_gx  = (xa.grad - xb.grad).float().abs().max().item()
-    e_gw  = (wa.grad - wb.grad).float().abs().max().item()
-    print(f"  V1 vs V0  y={e_y:.3e}  grad_x={e_gx:.3e}  grad_w={e_gw:.3e}")
-    e_y2  = (ya - yc).float().abs().max().item()
-    e_gx2 = (xa.grad - xc.grad).float().abs().max().item()
-    print(f"  V2 vs V0  y={e_y2:.3e}  grad_x={e_gx2:.3e}  (weight grad in packed layout, skipped)")
+    def diff(a, b): return (a - b).float().abs().max().item()
+    print(f"  V0 vs V_naive  y={diff(yn,ya):.3e}  grad_x={diff(xn.grad,xa.grad):.3e}  grad_w={diff(wn.grad,wa.grad):.3e}")
+    print(f"  V1 vs V0       y={diff(ya,yb):.3e}  grad_x={diff(xa.grad,xb.grad):.3e}  grad_w={diff(wa.grad,wb.grad):.3e}")
+    print(f"  V2 vs V_naive  y={diff(yn,yc):.3e}  grad_x={diff(xn.grad,xc.grad):.3e}  (weight grad in packed layout, skipped)")
     print()
 
 
 # ─────────────────────────────────────────────────────────────────────
 # Step builders
 # ─────────────────────────────────────────────────────────────────────
+def step_naive(x_buf, w_buf, grad_y):
+    x, w = fresh_leaves(x_buf, w_buf)
+    y = baseline_naive(x, w); y.backward(grad_y)
+
 def step_v0(x_buf, w_buf, grad_y):
     x, w = fresh_leaves(x_buf, w_buf)
     y = baseline_freshbuf(x, w); y.backward(grad_y)
@@ -170,6 +188,8 @@ def step_v2(x_buf, w_packed, grad_y):
     y = swp.fused_swiglu_wide_packed_save_factors_autograd(x, w); y.backward(grad_y)
 
 
+def fwd_naive(x_buf, w_buf):
+    x, w = fresh_leaves(x_buf, w_buf);  return baseline_naive(x, w)
 def fwd_v0(x_buf, w_buf):
     x, w = fresh_leaves(x_buf, w_buf);  return baseline_freshbuf(x, w)
 def fwd_v1(x_buf, w_buf):
@@ -212,45 +232,53 @@ def main():
 
     correctness_check(x_buf, w_buf, W_packed, grad_y)
 
-    # Warmup all variants (includes torch.compile JIT for V0/V1).
-    print("global warmup: 6 s mixed calls ...", flush=True)
+    # Warmup all variants (includes torch.compile JIT for V_naive/V0/V1
+    # and autotune profiling for V0/V1's bwd kernel).
+    print("global warmup: 8 s mixed calls ...", flush=True)
     import time
     t0 = time.time()
-    while time.time() - t0 < 6.0:
-        step_v0(x_buf, w_buf, grad_y)
-        step_v1(x_buf, w_buf, grad_y)
-        step_v2(x_buf, W_packed, grad_y)
+    while time.time() - t0 < 8.0:
+        step_naive(x_buf, w_buf,    grad_y)
+        step_v0   (x_buf, w_buf,    grad_y)
+        step_v1   (x_buf, w_buf,    grad_y)
+        step_v2   (x_buf, W_packed, grad_y)
     torch.cuda.synchronize()
     print()
 
     print("=== fwd timings (1 forward pass per call) ===")
-    t_fwd0 = bench(lambda: fwd_v0(x_buf, w_buf),    "V0 baseline_freshbuf fwd")
-    t_fwd1 = bench(lambda: fwd_v1(x_buf, w_buf),    "V1 baseline_inplace  fwd")
-    t_fwd2 = bench(lambda: fwd_v2(x_buf, W_packed), "V2 save_factors      fwd")
+    t_fwdn = bench(lambda: fwd_naive(x_buf, w_buf), "V_naive PyTorch-default fwd")
+    t_fwd0 = bench(lambda: fwd_v0(x_buf, w_buf),    "V0 baseline_freshbuf   fwd")
+    t_fwd1 = bench(lambda: fwd_v1(x_buf, w_buf),    "V1 baseline_inplace    fwd")
+    t_fwd2 = bench(lambda: fwd_v2(x_buf, W_packed), "V2 save_factors        fwd")
     print()
 
     print("=== full step timings (fwd + bwd per call) ===")
-    t_full0 = bench(lambda: step_v0(x_buf, w_buf,    grad_y), "V0 baseline_freshbuf full")
-    t_full1 = bench(lambda: step_v1(x_buf, w_buf,    grad_y), "V1 baseline_inplace  full")
-    t_full2 = bench(lambda: step_v2(x_buf, W_packed, grad_y), "V2 save_factors      full")
+    t_fulln = bench(lambda: step_naive(x_buf, w_buf, grad_y), "V_naive PyTorch-default full")
+    t_full0 = bench(lambda: step_v0(x_buf, w_buf,    grad_y), "V0 baseline_freshbuf   full")
+    t_full1 = bench(lambda: step_v1(x_buf, w_buf,    grad_y), "V1 baseline_inplace    full")
+    t_full2 = bench(lambda: step_v2(x_buf, W_packed, grad_y), "V2 save_factors        full")
     print()
 
     print("=== implied bwd-only (full − fwd) ===")
-    print(f"  V0  {(t_full0 - t_fwd0):6.3f} ms")
-    print(f"  V1  {(t_full1 - t_fwd1):6.3f} ms")
-    print(f"  V2  {(t_full2 - t_fwd2):6.3f} ms")
+    print(f"  V_naive  {(t_fulln - t_fwdn):6.3f} ms")
+    print(f"  V0       {(t_full0 - t_fwd0):6.3f} ms")
+    print(f"  V1       {(t_full1 - t_fwd1):6.3f} ms")
+    print(f"  V2       {(t_full2 - t_fwd2):6.3f} ms")
     print()
 
     print("=== peak transient allocation per full step (MiB) ===")
+    peakn = measure_peak_alloc(lambda: step_naive(x_buf, w_buf, grad_y))
     peak0 = measure_peak_alloc(lambda: step_v0(x_buf, w_buf,    grad_y))
     peak1 = measure_peak_alloc(lambda: step_v1(x_buf, w_buf,    grad_y))
     peak2 = measure_peak_alloc(lambda: step_v2(x_buf, W_packed, grad_y))
+    print(f"  V_naive PyTorch-default    peak  +{peakn:7.1f} MiB")
     print(f"  V0 baseline_freshbuf       peak  +{peak0:7.1f} MiB")
     print(f"  V1 baseline_inplace        peak  +{peak1:7.1f} MiB")
     print(f"  V2 save_factors            peak  +{peak2:7.1f} MiB")
     print()
-    print(f"  V0 − V1 (custom autograd savings) : {peak0 - peak1:+7.1f} MiB")
-    print(f"  V1 − V2 (residual after in-place) : {peak1 - peak2:+7.1f} MiB")
+    print(f"  V_naive − V1 (presentation savings) : {peakn - peak1:+7.1f} MiB")
+    print(f"  V0      − V1 (controlled in-place)  : {peak0 - peak1:+7.1f} MiB")
+    print(f"  V1      − V2 (residual after in-place): {peak1 - peak2:+7.1f} MiB")
     print()
     print(f"  reference: M·2N·2 (preact / grad_preact size) = "
           f"{M * 2 * N * 2 / (1024*1024):.1f} MiB")

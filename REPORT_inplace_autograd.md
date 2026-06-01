@@ -22,19 +22,32 @@ This report tests the hypothesis directly.
 
 ## Method
 
-Three variants, all computing `y = silu(gate) * left` where
+Four variants, all computing `y = silu(gate) * left` where
 `[left | gate] = x @ weight.t()`, with autograd enabled:
 
 | | fwd | bwd |
 |---|---|---|
-| **V0 baseline_freshbuf** | cuBLAS `F.linear` + `torch.compile`'d swiglu | custom autograd; fused Triton swiglu_backward writes to a **fresh** `grad_preact` buffer |
-| **V1 baseline_inplace**  | same as V0 | custom autograd; same kernel but writes **in place** over the saved `preact` |
+| **V_naive** (presentation baseline) | cuBLAS `F.linear` + `torch.compile`'d swiglu | **no custom autograd** — PyTorch handles backward via whatever it generates. Closest equivalent to `swiglu_fusion_notes.md`'s `baseline_F_linear`. |
+| **V0 baseline_freshbuf** (control) | same as V_naive | custom autograd; fused Triton swiglu_backward writes to a **fresh** `grad_preact` buffer |
+| **V1 baseline_inplace**  | same as V_naive | custom autograd; same kernel as V0 but writes **in place** over the saved `preact` |
 | **V2 save_factors** (production) | Triton `_fused_swiglu_wide_packed_save_factors_kernel` (matmul + side-store factors) | Triton `swiglu_packed_grad_de_from_factors_inplace` (in-place `factors *= dy`) |
 
-V0 and V1 share the same forward bytes for-byte. V2 is a different
-forward kernel that saves `factors` directly instead of `preact`.
+**V_naive** is what users get today with default PyTorch — it's the
+"presentation baseline" matching `swiglu_fusion_notes.md`'s reference
+point.
 
-Both V0/V1's backward uses the new `_swiglu_grad_preact_normal_kernel`
+**V0** is a deliberately-constructed *control variable*: it uses the
+same Triton bwd kernel as V1, but with a fresh output buffer instead of
+aliasing. The point of V0 is to isolate the **in-place buffer aliasing
+effect** from any other engineering differences (kernel choice,
+autograd implementation, intermediate ordering). V0 vs V1 differ in
+exactly one line: the third argument to the bwd kernel.
+
+V_naive vs V1 is the **presentation comparison** (what does the trick
+buy a real user?). V0 vs V1 is the **mechanistic comparison** (does the
+buffer aliasing itself cost or save anything in latency?).
+
+Both V0/V1's backward use the autotuned `_swiglu_grad_preact_normal_kernel`
 in [`swiglu/triton/impls.py`](swiglu/triton/impls.py), which takes
 separate input/output pointers — alias them for in-place, pass a fresh
 buffer for the freshbuf variant.
@@ -50,31 +63,42 @@ fwd+bwd step in isolation.
 
 | pair | y max_abs | grad_x max_abs | grad_w max_abs |
 |---|---|---|---|
+| V0 vs V_naive | **0.000e+00** | 4.883e-04 | 2.441e-04 |
 | V1 vs V0 | **0.000e+00** | **0.000e+00** | **0.000e+00** |
-| V2 vs V0 | 1.526e-05 | 4.883e-04 | — (packed layout) |
+| V2 vs V_naive | 1.526e-05 | 4.883e-04 | — (packed layout) |
 
-V1 is **bit-identical** to V0 — the in-place autograd Function makes
-zero observable change to outputs. V2 differs only at bf16-rounding
-noise (different math path: factors-then-multiply vs.
-swiglu_backward-from-preact).
+V0 vs V_naive: y is bit-identical (same fwd compute graph); gradients
+differ only by bf16-rounding noise (V0 uses our Triton kernel for the
+swiglu derivative, V_naive uses whatever PyTorch produces via
+`torch.compile` autograd).
+
+V1 vs V0: **fully bit-identical** including gradients — the in-place
+autograd Function makes zero observable change to outputs.
+
+V2 vs V_naive: differs only at bf16-rounding noise (different math
+path: factors-then-multiply vs. swiglu_backward-from-preact).
 
 ### Timing (medians, 2 s rep window, autotuned bwd kernel)
 
 | variant | fwd | full step | implied bwd |
 |---|---|---|---|
-| V0 baseline_freshbuf | 1.901 ms | 5.817 ms | 3.916 ms |
-| V1 baseline_inplace  | 1.905 ms | 5.822 ms | 3.917 ms |
-| V2 save_factors      | 1.909 ms | 5.781 ms | 3.873 ms |
+| V_naive PyTorch-default | 1.905 ms | **6.105 ms** | 4.200 ms |
+| V0 baseline_freshbuf    | 1.903 ms | 5.817 ms | 3.914 ms |
+| V1 baseline_inplace     | 1.907 ms | 5.822 ms | 3.915 ms |
+| V2 save_factors         | 1.913 ms | **5.786 ms** | 3.873 ms |
 
-- **Forward**: all three within ~8 µs (noise). The Triton fused kernel
-  (V2) is marginally slower than cuBLAS+compiled swiglu (V0/V1) — same
-  finding as [`REPORT_fwd_three_ways.md`](REPORT_fwd_three_ways.md).
-- **Backward**: V2 is consistently ~44 µs faster than V0/V1, even though
-  all three keep only one `[M, 2N]` tensor alive. The reason is that
-  **V2 has already done the SFU work in its forward** (see "Why V2 still
-  beats V1" below); V0 and V1's backward still has to compute
-  sigmoid + silu_prime per element.
-- **V0 vs V1 are bit-tied on backward** (3.916 vs 3.917 ms) — the
+- **Forward**: all four within ~10 µs (noise). The Triton fused kernel
+  (V2) is marginally slower than cuBLAS+compiled swiglu (V_naive/V0/V1)
+  — same finding as [`REPORT_fwd_three_ways.md`](REPORT_fwd_three_ways.md).
+- **Backward**: V_naive is ~285 µs slower than V0/V1, even though it
+  uses the same forward compute graph. This is the overhead of
+  PyTorch's `torch.compile`'d generic autograd vs. our specialized
+  Triton kernel — `torch.compile` re-derives the SwiGLU gradient
+  through its saved-tensor machinery, while our kernel implements it
+  directly. V2 is another ~42 µs faster than V0/V1 because **V2 has
+  already done the SFU work in its forward** (see "Why V2 still beats
+  V1" below).
+- **V0 vs V1 are bit-tied on backward** (3.914 vs 3.915 ms) — the
   freshbuf-vs-inplace difference is below measurement noise, confirming
   that the memory savings cost nothing in latency.
 
@@ -119,25 +143,37 @@ side-store.
 
 | | V1 | V2 | Δ |
 |---|---|---|---|
-| fwd | 1.905 ms | 1.909 ms | **+4 µs** (V2 does more) |
-| bwd | 3.917 ms | 3.873 ms | **−44 µs** (V2 skips the SFU) |
-| full | 5.822 ms | 5.781 ms | **−41 µs** |
+| fwd | 1.907 ms | 1.913 ms | **+6 µs** (V2 does more) |
+| bwd | 3.915 ms | 3.873 ms | **−42 µs** (V2 skips the SFU) |
+| full | 5.822 ms | 5.786 ms | **−36 µs** |
 
-V2 prepays ~4 µs in the forward to save ~44 µs in the backward — a
-**net ~41 µs win at this shape**. That's the "save factors" trick
+V2 prepays ~6 µs in the forward to save ~42 µs in the backward — a
+**net ~36 µs win at this shape**. That's the "save factors" trick
 earning its name: convert cheap-in-fwd SFU compute (hidden behind the
 matmul) into HBM-bound work in bwd (the cheapest possible kind of
 elementwise).
 
 ### Peak transient memory
 
-| variant | peak (MiB) | Δ vs V0 |
+| variant | peak (MiB) | Δ vs V1 |
 |---|---|---|
-| V0 baseline_freshbuf | **+2068.8** | — |
-| V1 baseline_inplace  | **+1458.8** | **−610.0** |
-| V2 save_factors      | **+1458.8** | **−610.0** |
+| V_naive PyTorch-default | **+1796.6** | **+337.9** |
+| V0 baseline_freshbuf    | **+2068.8** | **+610.0** |
+| V1 baseline_inplace     | **+1458.8** | — |
+| V2 save_factors         | **+1458.8** | **0.0** |
 
 Reference: `M · 2N · 2 = 609.0 MiB` (size of one preact / grad_preact tensor).
+
+**Two key facts**:
+
+1. **V_naive − V1 = 337.9 MiB** matches the **+338 MiB delta** the
+   original `swiglu_fusion_notes.md` reported between `baseline_F_linear`
+   (+1524.5 MiB) and `packed_save_factors_inplace` (+1186.6 MiB) almost
+   exactly. The absolute numbers differ (different swiglu kernel) but
+   **the savings is identical**.
+2. **V0 − V1 = 610.0 MiB ≈ M·2N·2** confirms V0's only extra cost
+   over V1 is one preact-sized buffer. The controlled comparison is
+   clean.
 
 ## Findings
 
@@ -155,18 +191,37 @@ identical peak memory to the production fused-kernel variant. The
 production kernel buys exactly **zero** memory savings over a properly
 written baseline at this shape.
 
-### 3. Bit-identical numerics with V0
+### 3. The presentation comparison: V_naive → V1
 
-The custom autograd path doesn't change a single bit of the output or
-the gradients. It's a pure transparent optimization for memory.
+For a user-facing claim, the relevant comparison is between **what
+people get today** (V_naive) and **what they could get with a custom
+autograd Function** (V1):
 
-### 4. The latency picture is essentially tied
+| | V_naive (today) | V1 (with custom autograd) | Δ |
+|---|---|---|---|
+| peak MiB | +1796.6 | +1458.8 | **−337.9 MiB** |
+| fwd | 1.905 ms | 1.907 ms | +2 µs (noise) |
+| bwd | 4.200 ms | 3.915 ms | **−285 µs** |
+| full | 6.105 ms | 5.822 ms | **−283 µs** |
 
-V1 vs V2 differ by ~100 µs at most on full step time. V2 is the fastest
-but only by a margin within run-to-run spread. The fused kernel's
-~120 µs side-store cost (documented in `REPORT_fwd_three_ways.md`) is
-matched almost exactly by V1's slightly cheaper forward (no side-store
-write).
+So a 30-line custom autograd Function + the autotuned Triton bwd
+kernel buys **−338 MiB peak memory AND −283 µs (4.6 %) full-step
+latency** vs. PyTorch-default, without writing a fused matmul kernel.
+
+V1 → V2 is a further +0 MiB / −36 µs (mostly bwd SFU savings; see
+section below) — incremental over V1, not over V_naive.
+
+### 4. Bit-identical numerics (V0 vs V1 stage)
+
+V1 vs V0 is fully bit-identical (max_abs = 0.000e+00 on output and
+both gradients) — the in-place autograd Function makes zero observable
+change. V0/V1 vs V_naive differ only at bf16-rounding noise.
+
+### 5. The mechanistic comparison: V0 vs V1
+
+V0 vs V1 are **bit-tied on backward** (3.914 vs 3.915 ms) — the
+freshbuf-vs-inplace difference is below measurement noise, confirming
+that the memory savings cost nothing in latency.
 
 ## Conclusion
 
@@ -182,10 +237,11 @@ This rewrites the trade-off we documented in
 [`REPORT_fwd_three_ways.md`](REPORT_fwd_three_ways.md). The production
 kernel's complexity buys:
 
-- **0 MiB** of memory savings vs. baseline + custom autograd.
-- **~+4 µs** of forward latency (V2 slightly slower from precomputing factors).
-- **~−44 µs** of backward latency (V2's bwd is HBM-bound; V1's still does SFU work).
-- **~−41 µs** net on the full step.
+- **0 MiB** of memory savings vs. V1 (baseline + custom autograd).
+- **~+6 µs** of forward latency (V2 slightly slower from precomputing factors).
+- **~−42 µs** of backward latency (V2's bwd is HBM-bound; V1's still does SFU work).
+- **~−36 µs** net on the full step over V1.
+- **~−319 µs** net on the full step over V_naive (today's PyTorch default).
 
 The latency win is *not* free engineering value: V2's backward is faster
 because its forward already paid the SFU cost (sigmoid + silu_prime),
