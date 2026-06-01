@@ -68,12 +68,58 @@ swiglu_backward-from-preact).
 
 - **Forward**: all three within ~12 µs (noise). The Triton fused kernel
   (V2) is marginally slower than cuBLAS+compiled swiglu (V0/V1) — same
-  finding as
-  [`REPORT_fwd_three_ways.md`](REPORT_fwd_three_ways.md).
-- **Backward**: all three within ~115 µs. V2 is the fastest by ~60–115 µs
-  (likely because the in-place `factors *= dy` is a tighter elementwise
-  than our `swiglu_backward_inplace` kernel), but within the run-to-run
-  spread.
+  finding as [`REPORT_fwd_three_ways.md`](REPORT_fwd_three_ways.md).
+- **Backward**: V2 is consistently ~115 µs faster than V1, even though
+  both keep only one `[M, 2N]` tensor alive. The reason is that **V2 has
+  already done the SFU work in its forward** (see "Why V2 still beats V1"
+  below); V1's backward still has to compute sigmoid + silu_prime
+  per element.
+
+### Why V2 still beats V1 on backward (115 µs)
+
+The two backward elementwise kernels do different amounts of math:
+
+**V1 backward** (`_swiglu_grad_preact_normal_kernel`) — takes raw
+`preact = [left | gate]` + `dy`. Per element:
+
+```
+sig         = sigmoid(gate)              ← SFU: exp + recip
+silu        = gate * sig
+silu_prime  = sig + silu * (1 - sig)
+grad_left   = dy * silu
+grad_gate   = dy * left * silu_prime
+```
+
+Two SFU ops per output element, plus the SwiGLU-derivative recomposition.
+
+**V2 backward** (`_swiglu_packed_grad_de_from_factors_ptr_kernel`) — takes
+`factors = [silu(gate) | left · silu'(gate)]` (precomputed in V2's
+forward) + `dy`. Per element:
+
+```
+grad_de_left = dy * factor_left
+grad_de_gate = dy * factor_gate
+```
+
+**Zero SFU ops.** Pure multiply. The backward is purely HBM-bound.
+
+**What V2 paid for it (in the forward)**: V2's forward does more work
+than V1's. Inside the matmul epilogue V2 also computes and writes
+`factors = [silu(gate) | left · silu'(gate)]`. The extra SFU compute is
+hidden behind the GEMM (compute-bound), and the extra HBM write is the
+side-store.
+
+| | V1 | V2 | Δ |
+|---|---|---|---|
+| fwd | 1.902 ms | 1.911 ms | **+9 µs** (V2 does more) |
+| bwd | 3.984 ms | 3.869 ms | **−115 µs** (V2 skips the SFU) |
+| full | 5.885 ms | 5.780 ms | **−106 µs** |
+
+V2 prepays ~9 µs in the forward to save ~115 µs in the backward — a
+**net ~106 µs win at this shape**. That's the "save factors" trick
+earning its name: convert cheap-in-fwd SFU compute (hidden behind the
+matmul) into HBM-bound work in bwd (the cheapest possible kind of
+elementwise).
 
 ### Peak transient memory
 
@@ -129,17 +175,28 @@ This rewrites the trade-off we documented in
 kernel's complexity buys:
 
 - **0 MiB** of memory savings vs. baseline + custom autograd.
-- **~+10 µs** of forward latency (V2 slightly slower than V0/V1's fwd).
-- **~−60 µs** of backward latency (V2's tighter in-place elementwise).
-- A **factors-side-store** that's useful if downstream code reads it
-  directly (e.g., for re-use across multiple backward passes, like
-  gradient checkpointing recomputes).
+- **~+9 µs** of forward latency (V2 slightly slower from precomputing factors).
+- **~−115 µs** of backward latency (V2's bwd is HBM-bound; V1's still does SFU work).
+- **~−106 µs** net on the full step.
 
-At this shape, **the practical recommendation flips**: prefer the
-custom-autograd baseline unless something downstream needs the factors
-tensor directly. It is structurally simpler (no chunked weight packing,
-no fused kernel maintenance), bit-identical to the canonical reference,
-and within noise on latency.
+The latency win is *not* free engineering value: V2's backward is faster
+because its forward already paid the SFU cost (sigmoid + silu_prime),
+storing the results into `factors`. V1's backward has to compute those
+SFU ops itself. So V2 isn't a memory trick — it's a **compute reuse**
+trick (factors as a cache of the SwiGLU-derivative pieces) that happens
+to also save the same memory V1 saves through its in-place autograd.
+
+The practical recommendation:
+
+- If you have downstream code that reads `factors` directly (e.g.,
+  gradient checkpointing that wants to re-use the cached SwiGLU pieces),
+  **V2 is the clear win** — same memory as V1, ~106 µs faster, and the
+  factors tensor is exposed.
+- If you don't care about the factors tensor, **V1 is essentially tied
+  on full-step latency** while being structurally much simpler (no
+  chunked weight packing, no fused kernel maintenance, bit-identical to
+  the canonical reference). 106 µs out of 5.8 ms ≈ 1.8 % — within the
+  range where simplicity may outweigh perf.
 
 ## Files
 
