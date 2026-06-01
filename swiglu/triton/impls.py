@@ -3902,6 +3902,107 @@ def fused_grad_x(
     return grad_x
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# In-place swiglu backward over preact in NORMAL [left | gate] layout.
+#
+# Used by the "baseline + custom autograd" path that proves the PyTorch
+# default backward's extra ~grad_preact allocation is the only reason the
+# baseline (cuBLAS F.linear + eager swiglu) has higher peak memory than
+# fused_swiglu_wide_packed_save_factors.  With this kernel + a custom
+# autograd Function, the baseline can do
+#   grad_preact = grad_y * d/dpreact[silu(gate) * left]
+# overwriting preact in place — no extra [M, 2N] allocation in backward.
+#
+# Layout: preact[M, 2N] is stored as [left[M, N] | gate[M, N]] (the cuBLAS
+# F.linear output of x @ weight.t() where weight is [2N, K]).  grad_preact
+# uses the same [grad_left | grad_gate] layout and overwrites preact byte
+# for byte.  In-place is safe because the per-tile load → compute → store
+# is sequential and tiles are independent.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+@triton.jit
+def _swiglu_grad_preact_normal_kernel(
+    preact_ptr,           # input  : [M, 2N] = [left | gate]
+    dy_ptr,               # input  : [M, N_HALF]
+    out_ptr,              # output : [M, 2N] = [grad_left | grad_gate]
+    M:            tl.constexpr,
+    N_HALF:       tl.constexpr,
+    BLOCK_M:      tl.constexpr,
+    BLOCK_N_HALF: tl.constexpr,
+):
+    """Fused swiglu backward over preact in NORMAL [left|gate] layout.
+    Set out_ptr == preact_ptr for the in-place variant: load → compute →
+    store sequence is per-tile and tiles are independent, so the alias
+    is safe (no read-after-write hazards across CTAs)."""
+    pid = tl.program_id(axis=0)
+    num_pid_n: tl.constexpr = tl.cdiv(N_HALF, BLOCK_N_HALF)
+    pid_m = pid // num_pid_n
+    pid_n = pid - pid_m * num_pid_n
+
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = pid_n * BLOCK_N_HALF + tl.arange(0, BLOCK_N_HALF)
+    stride = N_HALF * 2
+
+    left = tl.load(
+        preact_ptr + rows[:, None] * stride + cols[None, :]
+    ).to(tl.float32)
+    gate = tl.load(
+        preact_ptr + rows[:, None] * stride + (N_HALF + cols)[None, :]
+    ).to(tl.float32)
+    dy = tl.load(
+        dy_ptr + rows[:, None] * N_HALF + cols[None, :]
+    ).to(tl.float32)
+
+    sig = tl.sigmoid(gate)
+    silu = gate * sig
+    silu_prime = sig + silu * (1.0 - sig)
+    grad_left = dy * silu
+    grad_gate = dy * left * silu_prime
+
+    tl.store(
+        out_ptr + rows[:, None] * stride + cols[None, :],
+        grad_left.to(out_ptr.dtype.element_ty),
+    )
+    tl.store(
+        out_ptr + rows[:, None] * stride + (N_HALF + cols)[None, :],
+        grad_gate.to(out_ptr.dtype.element_ty),
+    )
+
+
+INPLACE_BWD_BLOCK_M       = 64
+INPLACE_BWD_BLOCK_N_HALF  = 128
+INPLACE_BWD_NUM_WARPS     = 4
+
+
+def swiglu_grad_preact_normal_inplace(preact: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
+    """Overwrite preact[M, 2N] with grad_preact (normal [left|gate] layout).
+
+    preact: in-place output buffer; on entry holds preact, on exit holds grad_preact.
+    dy    : [M, N] upstream gradient.
+    Returns the same `preact` tensor for convenience.
+    """
+    _ensure_allocator()
+    assert preact.is_cuda and dy.is_cuda
+    assert preact.is_contiguous() and dy.is_contiguous()
+    M, twoN = preact.shape
+    assert twoN % 2 == 0
+    N = twoN // 2
+    assert dy.shape == (M, N)
+    grid = (
+        triton.cdiv(M, INPLACE_BWD_BLOCK_M)
+        * triton.cdiv(N, INPLACE_BWD_BLOCK_N_HALF),
+    )
+    _swiglu_grad_preact_normal_inplace_kernel[grid](
+        preact, dy,
+        M, N,
+        BLOCK_M=INPLACE_BWD_BLOCK_M,
+        BLOCK_N_HALF=INPLACE_BWD_BLOCK_N_HALF,
+        num_warps=INPLACE_BWD_NUM_WARPS,
+    )
+    return preact
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=int, default=0)
