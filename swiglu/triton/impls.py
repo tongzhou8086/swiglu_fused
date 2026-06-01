@@ -3921,13 +3921,36 @@ def fused_grad_x(
 # ─────────────────────────────────────────────────────────────────────────
 
 
+@triton.autotune(
+    # Single-pass elementwise → HBM-bound.  Sweep tile shape and num_warps;
+    # num_stages=1 (no K-loop to pipeline).  Key on (M, N_HALF) so a new
+    # shape re-autotunes once and caches.
+    configs=[
+        triton.Config({"BLOCK_M":  32, "BLOCK_N_HALF":  64}, num_warps=2, num_stages=1),
+        triton.Config({"BLOCK_M":  32, "BLOCK_N_HALF": 128}, num_warps=2, num_stages=1),
+        triton.Config({"BLOCK_M":  32, "BLOCK_N_HALF": 256}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M":  64, "BLOCK_N_HALF":  64}, num_warps=2, num_stages=1),
+        triton.Config({"BLOCK_M":  64, "BLOCK_N_HALF":  64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M":  64, "BLOCK_N_HALF": 128}, num_warps=2, num_stages=1),
+        triton.Config({"BLOCK_M":  64, "BLOCK_N_HALF": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M":  64, "BLOCK_N_HALF": 256}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M":  64, "BLOCK_N_HALF": 256}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N_HALF":  64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N_HALF": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N_HALF": 128}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N_HALF": 256}, num_warps=8, num_stages=1),
+        # NB: BM=256 would not evenly divide M=11136 — would need OOB masks.
+        # Drop those configs and let autotune pick from BM ∈ {32, 64, 128}.
+    ],
+    key=["M", "N_HALF"],
+)
 @triton.jit
 def _swiglu_grad_preact_normal_kernel(
     preact_ptr,           # input  : [M, 2N] = [left | gate]
     dy_ptr,               # input  : [M, N_HALF]
     out_ptr,              # output : [M, 2N] = [grad_left | grad_gate]
-    M:            tl.constexpr,
-    N_HALF:       tl.constexpr,
+    M,                    # runtime — keyed by autotune
+    N_HALF,               # runtime — keyed by autotune
     BLOCK_M:      tl.constexpr,
     BLOCK_N_HALF: tl.constexpr,
 ):
@@ -3936,7 +3959,7 @@ def _swiglu_grad_preact_normal_kernel(
     store sequence is per-tile and tiles are independent, so the alias
     is safe (no read-after-write hazards across CTAs)."""
     pid = tl.program_id(axis=0)
-    num_pid_n: tl.constexpr = tl.cdiv(N_HALF, BLOCK_N_HALF)
+    num_pid_n = tl.cdiv(N_HALF, BLOCK_N_HALF)
     pid_m = pid // num_pid_n
     pid_n = pid - pid_m * num_pid_n
 
@@ -3970,11 +3993,6 @@ def _swiglu_grad_preact_normal_kernel(
     )
 
 
-INPLACE_BWD_BLOCK_M       = 64
-INPLACE_BWD_BLOCK_N_HALF  = 128
-INPLACE_BWD_NUM_WARPS     = 4
-
-
 def swiglu_grad_preact_normal_inplace(preact: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
     """Overwrite preact[M, 2N] with grad_preact (normal [left|gate] layout).
 
@@ -3983,7 +4001,8 @@ def swiglu_grad_preact_normal_inplace(preact: torch.Tensor, dy: torch.Tensor) ->
     Returns the same `preact` tensor for convenience.
 
     Implementation: calls _swiglu_grad_preact_normal_kernel with
-    out_ptr == preact_ptr (aliased) — see that kernel's docstring.
+    out_ptr == preact_ptr (aliased).  The kernel is autotuned on (M, N_HALF)
+    so the tile shape + num_warps are picked at first-call time and cached.
     """
     _ensure_allocator()
     assert preact.is_cuda and dy.is_cuda
@@ -3992,16 +4011,13 @@ def swiglu_grad_preact_normal_inplace(preact: torch.Tensor, dy: torch.Tensor) ->
     assert twoN % 2 == 0
     N = twoN // 2
     assert dy.shape == (M, N)
-    grid = (
-        triton.cdiv(M, INPLACE_BWD_BLOCK_M)
-        * triton.cdiv(N, INPLACE_BWD_BLOCK_N_HALF),
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N_HALF"]),
     )
     _swiglu_grad_preact_normal_kernel[grid](
         preact, dy, preact,    # out_ptr aliased to preact_ptr → in-place
         M, N,
-        BLOCK_M=INPLACE_BWD_BLOCK_M,
-        BLOCK_N_HALF=INPLACE_BWD_BLOCK_N_HALF,
-        num_warps=INPLACE_BWD_NUM_WARPS,
+        # BLOCK_M, BLOCK_N_HALF, num_warps come from autotune
     )
     return preact
 

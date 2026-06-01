@@ -24,12 +24,7 @@ import triton.testing as tt
 sys.path.insert(0, os.path.expanduser("~/projects/swiglu_fused"))
 sys.path.insert(0, os.path.expanduser("~/projects/swiglu_fused/swiglu/swiglu_layer"))
 import fused_swiglu_wide_packed as swp
-from swiglu.triton.impls import (
-    _swiglu_grad_preact_normal_kernel,
-    INPLACE_BWD_BLOCK_M as BM_BWD,
-    INPLACE_BWD_BLOCK_N_HALF as BN_BWD,
-    INPLACE_BWD_NUM_WARPS as NW_BWD,
-)
+from swiglu.triton.impls import _swiglu_grad_preact_normal_kernel
 
 
 M, K, N = 11136, 3584, 14336
@@ -41,14 +36,16 @@ torch.manual_seed(0)
 # ─────────────────────────────────────────────────────────────────────
 # Helpers — fused swiglu backward kernel callable.
 # Passing `out is preact` → in-place; passing fresh `out` → extra buffer.
+# Tile shape + num_warps come from the kernel's @triton.autotune decorator.
 # ─────────────────────────────────────────────────────────────────────
 def swiglu_grad_preact_normal(preact, dy, out):
     M_, twoN_ = preact.shape
     N_ = twoN_ // 2
-    grid = (triton.cdiv(M_, BM_BWD) * triton.cdiv(N_, BN_BWD),)
+    grid = lambda META: (
+        triton.cdiv(M_, META["BLOCK_M"]) * triton.cdiv(N_, META["BLOCK_N_HALF"]),
+    )
     _swiglu_grad_preact_normal_kernel[grid](
         preact, dy, out, M_, N_,
-        BLOCK_M=BM_BWD, BLOCK_N_HALF=BN_BWD, num_warps=NW_BWD,
     )
     return out
 

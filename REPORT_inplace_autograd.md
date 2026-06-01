@@ -58,22 +58,30 @@ zero observable change to outputs. V2 differs only at bf16-rounding
 noise (different math path: factors-then-multiply vs.
 swiglu_backward-from-preact).
 
-### Timing (medians, 2 s rep window)
+### Timing (medians, 2 s rep window, autotuned bwd kernel)
 
 | variant | fwd | full step | implied bwd |
 |---|---|---|---|
-| V0 baseline_freshbuf | 1.899 ms | 5.831 ms | 3.931 ms |
-| V1 baseline_inplace  | 1.902 ms | 5.885 ms | 3.984 ms |
-| V2 save_factors      | 1.911 ms | 5.780 ms | 3.869 ms |
+| V0 baseline_freshbuf | 1.901 ms | 5.817 ms | 3.916 ms |
+| V1 baseline_inplace  | 1.905 ms | 5.822 ms | 3.917 ms |
+| V2 save_factors      | 1.909 ms | 5.781 ms | 3.873 ms |
 
-- **Forward**: all three within ~12 µs (noise). The Triton fused kernel
+- **Forward**: all three within ~8 µs (noise). The Triton fused kernel
   (V2) is marginally slower than cuBLAS+compiled swiglu (V0/V1) — same
   finding as [`REPORT_fwd_three_ways.md`](REPORT_fwd_three_ways.md).
-- **Backward**: V2 is consistently ~115 µs faster than V1, even though
-  both keep only one `[M, 2N]` tensor alive. The reason is that **V2 has
-  already done the SFU work in its forward** (see "Why V2 still beats V1"
-  below); V1's backward still has to compute sigmoid + silu_prime
-  per element.
+- **Backward**: V2 is consistently ~44 µs faster than V0/V1, even though
+  all three keep only one `[M, 2N]` tensor alive. The reason is that
+  **V2 has already done the SFU work in its forward** (see "Why V2 still
+  beats V1" below); V0 and V1's backward still has to compute
+  sigmoid + silu_prime per element.
+- **V0 vs V1 are bit-tied on backward** (3.916 vs 3.917 ms) — the
+  freshbuf-vs-inplace difference is below measurement noise, confirming
+  that the memory savings cost nothing in latency.
+
+The bwd kernel `_swiglu_grad_preact_normal_kernel` is autotuned via
+`@triton.autotune`; at this shape the winning config is
+`BLOCK_M=32, BLOCK_N_HALF=64, num_warps=2` — small tiles with high SM
+occupancy, fitting the HBM-bound nature of the kernel.
 
 ### Why V2 still beats V1 on backward (115 µs)
 
@@ -111,12 +119,12 @@ side-store.
 
 | | V1 | V2 | Δ |
 |---|---|---|---|
-| fwd | 1.902 ms | 1.911 ms | **+9 µs** (V2 does more) |
-| bwd | 3.984 ms | 3.869 ms | **−115 µs** (V2 skips the SFU) |
-| full | 5.885 ms | 5.780 ms | **−106 µs** |
+| fwd | 1.905 ms | 1.909 ms | **+4 µs** (V2 does more) |
+| bwd | 3.917 ms | 3.873 ms | **−44 µs** (V2 skips the SFU) |
+| full | 5.822 ms | 5.781 ms | **−41 µs** |
 
-V2 prepays ~9 µs in the forward to save ~115 µs in the backward — a
-**net ~106 µs win at this shape**. That's the "save factors" trick
+V2 prepays ~4 µs in the forward to save ~44 µs in the backward — a
+**net ~41 µs win at this shape**. That's the "save factors" trick
 earning its name: convert cheap-in-fwd SFU compute (hidden behind the
 matmul) into HBM-bound work in bwd (the cheapest possible kind of
 elementwise).
@@ -175,9 +183,9 @@ This rewrites the trade-off we documented in
 kernel's complexity buys:
 
 - **0 MiB** of memory savings vs. baseline + custom autograd.
-- **~+9 µs** of forward latency (V2 slightly slower from precomputing factors).
-- **~−115 µs** of backward latency (V2's bwd is HBM-bound; V1's still does SFU work).
-- **~−106 µs** net on the full step.
+- **~+4 µs** of forward latency (V2 slightly slower from precomputing factors).
+- **~−44 µs** of backward latency (V2's bwd is HBM-bound; V1's still does SFU work).
+- **~−41 µs** net on the full step.
 
 The latency win is *not* free engineering value: V2's backward is faster
 because its forward already paid the SFU cost (sigmoid + silu_prime),
@@ -195,8 +203,8 @@ The practical recommendation:
 - If you don't care about the factors tensor, **V1 is essentially tied
   on full-step latency** while being structurally much simpler (no
   chunked weight packing, no fused kernel maintenance, bit-identical to
-  the canonical reference). 106 µs out of 5.8 ms ≈ 1.8 % — within the
-  range where simplicity may outweigh perf.
+  the canonical reference). 41 µs out of 5.8 ms ≈ 0.7 % — within the
+  range where simplicity outweighs perf.
 
 ## Files
 
